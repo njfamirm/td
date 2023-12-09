@@ -6,7 +6,7 @@ if (POLICY CMP0065)
   cmake_policy(SET CMP0065 NEW)
 endif()
 
-project(TDLib VERSION 1.8.21 LANGUAGES CXX C)
+project(TDLib VERSION 1.8.22 LANGUAGES CXX C)
 
 if (NOT DEFINED CMAKE_MODULE_PATH)
   set(CMAKE_MODULE_PATH "")
@@ -485,6 +485,7 @@ set(TDLIB_SOURCE
   td/telegram/StoryContent.cpp
   td/telegram/StoryContentType.cpp
   td/telegram/StoryDb.cpp
+  td/telegram/StoryForwardInfo.cpp
   td/telegram/StoryInteractionInfo.cpp
   td/telegram/StoryManager.cpp
   td/telegram/StoryStealthMode.cpp
@@ -498,6 +499,7 @@ set(TDLIB_SOURCE
   td/telegram/TopDialogCategory.cpp
   td/telegram/TopDialogManager.cpp
   td/telegram/TranscriptionInfo.cpp
+  td/telegram/TranscriptionManager.cpp
   td/telegram/TranslationManager.cpp
   td/telegram/UpdatesManager.cpp
   td/telegram/Usernames.cpp
@@ -803,6 +805,7 @@ set(TDLIB_SOURCE
   td/telegram/StoryDb.h
   td/telegram/StoryFullId.h
   td/telegram/StoryId.h
+  td/telegram/StoryForwardInfo.h
   td/telegram/StoryInteractionInfo.h
   td/telegram/StoryListId.h
   td/telegram/StoryManager.h
@@ -819,6 +822,7 @@ set(TDLIB_SOURCE
   td/telegram/TopDialogCategory.h
   td/telegram/TopDialogManager.h
   td/telegram/TranscriptionInfo.h
+  td/telegram/TranscriptionManager.h
   td/telegram/TranslationManager.h
   td/telegram/UniqueId.h
   td/telegram/UpdatesManager.h
@@ -891,6 +895,7 @@ set(TDLIB_SOURCE
   td/telegram/StickerMaskPosition.hpp
   td/telegram/StickerPhotoSize.hpp
   td/telegram/StickersManager.hpp
+  td/telegram/StoryForwardInfo.hpp
   td/telegram/StoryInteractionInfo.hpp
   td/telegram/StoryStealthMode.hpp
   td/telegram/TranscriptionInfo.hpp

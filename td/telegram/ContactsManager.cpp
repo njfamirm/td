@@ -786,11 +786,16 @@ class UpdateColorQuery final : public Td::ResultHandler {
     accent_color_id_ = accent_color_id;
     background_custom_emoji_id_ = background_custom_emoji_id;
     int32 flags = 0;
+    if (accent_color_id.is_valid()) {
+      flags |= telegram_api::account_updateColor::COLOR_MASK;
+    }
     if (background_custom_emoji_id.is_valid()) {
       flags |= telegram_api::account_updateColor::BACKGROUND_EMOJI_ID_MASK;
     }
     send_query(G()->net_query_creator().create(
-        telegram_api::account_updateColor(flags, accent_color_id.get(), background_custom_emoji_id.get()), {{"me"}}));
+        telegram_api::account_updateColor(flags, false /*ignored*/, accent_color_id.get(),
+                                          background_custom_emoji_id.get()),
+        {{"me"}}));
   }
 
   void on_result(BufferSlice packet) final {
@@ -801,6 +806,47 @@ class UpdateColorQuery final : public Td::ResultHandler {
 
     LOG(DEBUG) << "Receive result for UpdateColorQuery: " << result_ptr.ok();
     td_->contacts_manager_->on_update_accent_color_success(accent_color_id_, background_custom_emoji_id_);
+    promise_.set_value(Unit());
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
+  }
+};
+
+class UpdateProfileColorQuery final : public Td::ResultHandler {
+  Promise<Unit> promise_;
+  AccentColorId accent_color_id_;
+  CustomEmojiId background_custom_emoji_id_;
+
+ public:
+  explicit UpdateProfileColorQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(AccentColorId accent_color_id, CustomEmojiId background_custom_emoji_id) {
+    accent_color_id_ = accent_color_id;
+    background_custom_emoji_id_ = background_custom_emoji_id;
+    int32 flags = telegram_api::account_updateColor::FOR_PROFILE_MASK;
+    if (accent_color_id.is_valid()) {
+      flags |= telegram_api::account_updateColor::COLOR_MASK;
+    }
+    if (background_custom_emoji_id.is_valid()) {
+      flags |= telegram_api::account_updateColor::BACKGROUND_EMOJI_ID_MASK;
+    }
+    send_query(G()->net_query_creator().create(
+        telegram_api::account_updateColor(flags, false /*ignored*/, accent_color_id.get(),
+                                          background_custom_emoji_id.get()),
+        {{"me"}}));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::account_updateColor>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    LOG(DEBUG) << "Receive result for UpdateProfileColorQuery: " << result_ptr.ok();
+    td_->contacts_manager_->on_update_profile_accent_color_success(accent_color_id_, background_custom_emoji_id_);
     promise_.set_value(Unit());
   }
 
@@ -3274,6 +3320,55 @@ class MigrateChatQuery final : public Td::ResultHandler {
   }
 };
 
+class GetChannelRecommendationsQuery final : public Td::ResultHandler {
+  Promise<std::pair<int32, vector<tl_object_ptr<telegram_api::Chat>>>> promise_;
+  ChannelId channel_id_;
+
+ public:
+  explicit GetChannelRecommendationsQuery(
+      Promise<std::pair<int32, vector<tl_object_ptr<telegram_api::Chat>>>> &&promise)
+      : promise_(std::move(promise)) {
+  }
+
+  void send(ChannelId channel_id) {
+    channel_id_ = channel_id;
+
+    auto input_channel = td_->contacts_manager_->get_input_channel(channel_id);
+    CHECK(input_channel != nullptr);
+    send_query(
+        G()->net_query_creator().create(telegram_api::channels_getChannelRecommendations(std::move(input_channel))));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::channels_getChannelRecommendations>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto chats_ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for GetChannelRecommendationsQuery: " << to_string(chats_ptr);
+    switch (chats_ptr->get_id()) {
+      case telegram_api::messages_chats::ID: {
+        auto chats = move_tl_object_as<telegram_api::messages_chats>(chats_ptr);
+        auto total_count = static_cast<int32>(chats->chats_.size());
+        return promise_.set_value({total_count, std::move(chats->chats_)});
+      }
+      case telegram_api::messages_chatsSlice::ID: {
+        auto chats = move_tl_object_as<telegram_api::messages_chatsSlice>(chats_ptr);
+        return promise_.set_value({chats->count_, std::move(chats->chats_)});
+      }
+      default:
+        UNREACHABLE();
+        return promise_.set_error(Status::Error("Unreachable"));
+    }
+  }
+
+  void on_error(Status status) final {
+    td_->contacts_manager_->on_get_channel_error(channel_id_, status, "GetChannelRecommendationsQuery");
+    promise_.set_error(std::move(status));
+  }
+};
+
 class GetCreatedPublicChannelsQuery final : public Td::ResultHandler {
   Promise<Unit> promise_;
   PublicDialogType type_;
@@ -3947,6 +4042,9 @@ ContactsManager::ContactsManager(Td *td, ActorShared<> parent) : td_(td), parent
   }
   if (G()->use_sqlite_pmc()) {
     G()->td_db()->get_sqlite_pmc()->erase_by_prefix("us_bot_info", Auto());
+    if (!G()->use_message_database()) {
+      G()->td_db()->get_sqlite_pmc()->erase_by_prefix("channel_recommendations", Auto());
+    }
   }
 
   was_online_local_ = to_integer<int32>(G()->td_db()->get_binlog_pmc()->get("my_was_online_local"));
@@ -4269,6 +4367,8 @@ void ContactsManager::User::store(StorerT &storer) const {
   bool has_max_active_story_id_next_reload_time = max_active_story_id_next_reload_time > Time::now();
   bool has_accent_color_id = accent_color_id.is_valid();
   bool has_background_custom_emoji_id = background_custom_emoji_id.is_valid();
+  bool has_profile_accent_color_id = profile_accent_color_id.is_valid();
+  bool has_profile_background_custom_emoji_id = profile_background_custom_emoji_id.is_valid();
   BEGIN_STORE_FLAGS();
   STORE_FLAG(is_received);
   STORE_FLAG(is_verified);
@@ -4311,6 +4411,8 @@ void ContactsManager::User::store(StorerT &storer) const {
     STORE_FLAG(has_max_active_story_id_next_reload_time);
     STORE_FLAG(has_accent_color_id);
     STORE_FLAG(has_background_custom_emoji_id);
+    STORE_FLAG(has_profile_accent_color_id);
+    STORE_FLAG(has_profile_background_custom_emoji_id);
     END_STORE_FLAGS();
   }
   store(first_name, storer);
@@ -4361,6 +4463,12 @@ void ContactsManager::User::store(StorerT &storer) const {
   if (has_background_custom_emoji_id) {
     store(background_custom_emoji_id, storer);
   }
+  if (has_profile_accent_color_id) {
+    store(profile_accent_color_id, storer);
+  }
+  if (has_profile_background_custom_emoji_id) {
+    store(profile_background_custom_emoji_id, storer);
+  }
 }
 
 template <class ParserT>
@@ -4384,6 +4492,8 @@ void ContactsManager::User::parse(ParserT &parser) {
   bool has_max_active_story_id_next_reload_time = false;
   bool has_accent_color_id = false;
   bool has_background_custom_emoji_id = false;
+  bool has_profile_accent_color_id = false;
+  bool has_profile_background_custom_emoji_id = false;
   BEGIN_PARSE_FLAGS();
   PARSE_FLAG(is_received);
   PARSE_FLAG(is_verified);
@@ -4426,6 +4536,8 @@ void ContactsManager::User::parse(ParserT &parser) {
     PARSE_FLAG(has_max_active_story_id_next_reload_time);
     PARSE_FLAG(has_accent_color_id);
     PARSE_FLAG(has_background_custom_emoji_id);
+    PARSE_FLAG(has_profile_accent_color_id);
+    PARSE_FLAG(has_profile_background_custom_emoji_id);
     END_PARSE_FLAGS();
   }
   parse(first_name, parser);
@@ -4504,6 +4616,12 @@ void ContactsManager::User::parse(ParserT &parser) {
   if (has_background_custom_emoji_id) {
     parse(background_custom_emoji_id, parser);
   }
+  if (has_profile_accent_color_id) {
+    parse(profile_accent_color_id, parser);
+  }
+  if (has_profile_background_custom_emoji_id) {
+    parse(profile_background_custom_emoji_id, parser);
+  }
 
   if (!check_utf8(first_name)) {
     LOG(ERROR) << "Have invalid first name \"" << first_name << '"';
@@ -4571,6 +4689,7 @@ void ContactsManager::UserFull::store(StorerT &storer) const {
   STORE_FLAG(has_fallback_photo);
   STORE_FLAG(has_pinned_stories);
   STORE_FLAG(is_blocked_for_stories);
+  STORE_FLAG(wallpaper_overridden);
   END_STORE_FLAGS();
   if (has_about) {
     store(about, storer);
@@ -4655,6 +4774,7 @@ void ContactsManager::UserFull::parse(ParserT &parser) {
   PARSE_FLAG(has_fallback_photo);
   PARSE_FLAG(has_pinned_stories);
   PARSE_FLAG(is_blocked_for_stories);
+  PARSE_FLAG(wallpaper_overridden);
   END_PARSE_FLAGS();
   if (has_about) {
     parse(about, parser);
@@ -5443,6 +5563,42 @@ void ContactsManager::SecretChat::parse(ParserT &parser) {
   }
   if (has_initial_folder_id) {
     parse(initial_folder_id, parser);
+  }
+}
+
+template <class StorerT>
+void ContactsManager::RecommendedDialogs::store(StorerT &storer) const {
+  bool has_dialog_ids = !dialog_ids_.empty();
+  bool has_total_count = static_cast<size_t>(total_count_) != dialog_ids_.size();
+  BEGIN_STORE_FLAGS();
+  STORE_FLAG(has_dialog_ids);
+  STORE_FLAG(has_total_count);
+  END_STORE_FLAGS();
+  if (has_dialog_ids) {
+    td::store(dialog_ids_, storer);
+  }
+  store_time(next_reload_time_, storer);
+  if (has_total_count) {
+    td::store(total_count_, storer);
+  }
+}
+
+template <class ParserT>
+void ContactsManager::RecommendedDialogs::parse(ParserT &parser) {
+  bool has_dialog_ids;
+  bool has_total_count;
+  BEGIN_PARSE_FLAGS();
+  PARSE_FLAG(has_dialog_ids);
+  PARSE_FLAG(has_total_count);
+  END_PARSE_FLAGS();
+  if (has_dialog_ids) {
+    td::parse(dialog_ids_, parser);
+  }
+  parse_time(next_reload_time_, parser);
+  if (has_total_count) {
+    td::parse(total_count_, parser);
+  } else {
+    total_count_ = static_cast<int32>(dialog_ids_.size());
   }
 }
 
@@ -7681,8 +7837,16 @@ void ContactsManager::set_accent_color(AccentColorId accent_color_id, CustomEmoj
   if (!accent_color_id.is_valid()) {
     return promise.set_error(Status::Error(400, "Invalid accent color identifier specified"));
   }
+  if (accent_color_id == AccentColorId(get_my_id())) {
+    accent_color_id = AccentColorId();
+  }
 
   td_->create_handler<UpdateColorQuery>(std::move(promise))->send(accent_color_id, background_custom_emoji_id);
+}
+
+void ContactsManager::set_profile_accent_color(AccentColorId accent_color_id, CustomEmojiId background_custom_emoji_id,
+                                               Promise<Unit> &&promise) {
+  td_->create_handler<UpdateProfileColorQuery>(std::move(promise))->send(accent_color_id, background_custom_emoji_id);
 }
 
 void ContactsManager::set_name(const string &first_name, const string &last_name, Promise<Unit> &&promise) {
@@ -7741,6 +7905,18 @@ void ContactsManager::on_update_accent_color_success(AccentColorId accent_color_
   }
   on_update_user_accent_color_id(u, user_id, accent_color_id);
   on_update_user_background_custom_emoji_id(u, user_id, background_custom_emoji_id);
+  update_user(u, user_id);
+}
+
+void ContactsManager::on_update_profile_accent_color_success(AccentColorId accent_color_id,
+                                                             CustomEmojiId background_custom_emoji_id) {
+  auto user_id = get_my_id();
+  User *u = get_user_force(user_id, "on_update_profile_accent_color_success");
+  if (u == nullptr) {
+    return;
+  }
+  on_update_user_profile_accent_color_id(u, user_id, accent_color_id);
+  on_update_user_profile_background_custom_emoji_id(u, user_id, background_custom_emoji_id);
   update_user(u, user_id);
 }
 
@@ -8451,13 +8627,14 @@ void ContactsManager::get_channel_statistics_dc_id_impl(ChannelId channel_id, bo
   }
 
   if (!channel_full->stats_dc_id.is_exact() || (for_full_statistics && !channel_full->can_view_statistics)) {
-    return promise.set_error(Status::Error(400, "Chat statistics is not available"));
+    return promise.set_error(Status::Error(400, "Chat statistics are not available"));
   }
 
   promise.set_value(DcId(channel_full->stats_dc_id));
 }
 
 bool ContactsManager::can_get_channel_message_statistics(DialogId dialog_id) const {
+  CHECK(!td_->auth_manager_->is_bot());
   if (dialog_id.get_type() != DialogType::Channel) {
     return false;
   }
@@ -8468,7 +8645,23 @@ bool ContactsManager::can_get_channel_message_statistics(DialogId dialog_id) con
     return false;
   }
 
-  if (td_->auth_manager_->is_bot()) {
+  auto channel_full = get_channel_full(channel_id);
+  if (channel_full != nullptr) {
+    return channel_full->stats_dc_id.is_exact();
+  }
+
+  return c->status.can_post_messages();
+}
+
+bool ContactsManager::can_get_channel_story_statistics(DialogId dialog_id) const {
+  CHECK(!td_->auth_manager_->is_bot());
+  if (dialog_id.get_type() != DialogType::Channel) {
+    return false;
+  }
+
+  auto channel_id = dialog_id.get_channel_id();
+  const Channel *c = get_channel(channel_id);
+  if (c == nullptr || c->is_megagroup) {
     return false;
   }
 
@@ -9519,6 +9712,257 @@ vector<DialogId> ContactsManager::get_dialog_ids(vector<tl_object_ptr<telegram_a
   return dialog_ids;
 }
 
+bool ContactsManager::is_suitable_recommended_channel(DialogId dialog_id) const {
+  if (dialog_id.get_type() != DialogType::Channel) {
+    return false;
+  }
+  return is_suitable_recommended_channel(dialog_id.get_channel_id());
+}
+
+bool ContactsManager::is_suitable_recommended_channel(ChannelId channel_id) const {
+  const Channel *c = get_channel(channel_id);
+  if (c == nullptr) {
+    return false;
+  }
+  return have_input_peer_channel(c, channel_id, AccessRights::Read) && !get_channel_status(c).is_member();
+}
+
+bool ContactsManager::are_suitable_recommended_dialogs(const RecommendedDialogs &recommended_dialogs) const {
+  for (auto recommended_dialog_id : recommended_dialogs.dialog_ids_) {
+    if (!is_suitable_recommended_channel(recommended_dialog_id)) {
+      return false;
+    }
+  }
+  auto is_premium = td_->option_manager_->get_option_boolean("is_premium");
+  auto have_all = recommended_dialogs.dialog_ids_.size() == static_cast<size_t>(recommended_dialogs.total_count_);
+  if (!have_all && is_premium) {
+    return false;
+  }
+  return true;
+}
+
+void ContactsManager::get_channel_recommendations(DialogId dialog_id, bool return_local,
+                                                  Promise<td_api::object_ptr<td_api::chats>> &&chats_promise,
+                                                  Promise<td_api::object_ptr<td_api::count>> &&count_promise) {
+  if (!td_->messages_manager_->have_dialog_force(dialog_id, "get_channel_recommendations")) {
+    if (chats_promise) {
+      chats_promise.set_error(Status::Error(400, "Chat not found"));
+    }
+    if (count_promise) {
+      count_promise.set_error(Status::Error(400, "Chat not found"));
+    }
+    return;
+  }
+  if (dialog_id.get_type() != DialogType::Channel) {
+    if (chats_promise) {
+      chats_promise.set_value(td_api::make_object<td_api::chats>());
+    }
+    if (count_promise) {
+      count_promise.set_value(td_api::make_object<td_api::count>(0));
+    }
+    return;
+  }
+  auto channel_id = dialog_id.get_channel_id();
+  if (!is_broadcast_channel(channel_id) || get_input_channel(channel_id) == nullptr) {
+    if (chats_promise) {
+      chats_promise.set_value(td_api::make_object<td_api::chats>());
+    }
+    if (count_promise) {
+      count_promise.set_value(td_api::make_object<td_api::count>(0));
+    }
+    return;
+  }
+  bool use_database = true;
+  auto it = channel_recommended_dialogs_.find(channel_id);
+  if (it != channel_recommended_dialogs_.end()) {
+    if (are_suitable_recommended_dialogs(it->second)) {
+      auto next_reload_time = it->second.next_reload_time_;
+      if (chats_promise) {
+        chats_promise.set_value(td_->messages_manager_->get_chats_object(
+            it->second.total_count_, it->second.dialog_ids_, "get_channel_recommendations"));
+      }
+      if (count_promise) {
+        count_promise.set_value(td_api::make_object<td_api::count>(it->second.total_count_));
+      }
+      if (next_reload_time > Time::now()) {
+        return;
+      }
+      chats_promise = {};
+      count_promise = {};
+    } else {
+      LOG(INFO) << "Drop cache for similar chats of " << dialog_id;
+      channel_recommended_dialogs_.erase(it);
+      if (G()->use_message_database()) {
+        G()->td_db()->get_sqlite_pmc()->erase(get_channel_recommendations_database_key(channel_id), Auto());
+      }
+    }
+    use_database = false;
+  }
+  load_channel_recommendations(channel_id, use_database, return_local, std::move(chats_promise),
+                               std::move(count_promise));
+}
+
+string ContactsManager::get_channel_recommendations_database_key(ChannelId channel_id) {
+  return PSTRING() << "channel_recommendations" << channel_id.get();
+}
+
+void ContactsManager::load_channel_recommendations(ChannelId channel_id, bool use_database, bool return_local,
+                                                   Promise<td_api::object_ptr<td_api::chats>> &&chats_promise,
+                                                   Promise<td_api::object_ptr<td_api::count>> &&count_promise) {
+  if (count_promise) {
+    get_channel_recommendation_count_queries_[return_local][channel_id].push_back(std::move(count_promise));
+  }
+  auto &queries = get_channel_recommendations_queries_[channel_id];
+  queries.push_back(std::move(chats_promise));
+  if (queries.size() == 1) {
+    if (G()->use_message_database() && use_database) {
+      G()->td_db()->get_sqlite_pmc()->get(
+          get_channel_recommendations_database_key(channel_id),
+          PromiseCreator::lambda([actor_id = actor_id(this), channel_id](string value) {
+            send_closure(actor_id, &ContactsManager::on_load_channel_recommendations_from_database, channel_id,
+                         std::move(value));
+          }));
+    } else {
+      reload_channel_recommendations(channel_id);
+    }
+  }
+}
+
+void ContactsManager::fail_load_channel_recommendations_queries(ChannelId channel_id, Status &&error) {
+  for (int return_local = 0; return_local < 2; return_local++) {
+    auto it = get_channel_recommendation_count_queries_[return_local].find(channel_id);
+    if (it != get_channel_recommendation_count_queries_[return_local].end()) {
+      auto promises = std::move(it->second);
+      CHECK(!promises.empty());
+      get_channel_recommendation_count_queries_[return_local].erase(it);
+      fail_promises(promises, error.clone());
+    }
+  }
+  auto it = get_channel_recommendations_queries_.find(channel_id);
+  CHECK(it != get_channel_recommendations_queries_.end());
+  auto promises = std::move(it->second);
+  CHECK(!promises.empty());
+  get_channel_recommendations_queries_.erase(it);
+  fail_promises(promises, std::move(error));
+}
+
+void ContactsManager::finish_load_channel_recommendations_queries(ChannelId channel_id, int32 total_count,
+                                                                  vector<DialogId> dialog_ids) {
+  for (int return_local = 0; return_local < 2; return_local++) {
+    auto it = get_channel_recommendation_count_queries_[return_local].find(channel_id);
+    if (it != get_channel_recommendation_count_queries_[return_local].end()) {
+      auto promises = std::move(it->second);
+      CHECK(!promises.empty());
+      get_channel_recommendation_count_queries_[return_local].erase(it);
+      for (auto &promise : promises) {
+        promise.set_value(td_api::make_object<td_api::count>(total_count));
+      }
+    }
+  }
+  auto it = get_channel_recommendations_queries_.find(channel_id);
+  CHECK(it != get_channel_recommendations_queries_.end());
+  auto promises = std::move(it->second);
+  CHECK(!promises.empty());
+  get_channel_recommendations_queries_.erase(it);
+  for (auto &promise : promises) {
+    if (promise) {
+      promise.set_value(td_->messages_manager_->get_chats_object(total_count, dialog_ids,
+                                                                 "finish_load_channel_recommendations_queries"));
+    }
+  }
+}
+
+void ContactsManager::on_load_channel_recommendations_from_database(ChannelId channel_id, string value) {
+  if (G()->close_flag()) {
+    return fail_load_channel_recommendations_queries(channel_id, G()->close_status());
+  }
+
+  if (value.empty()) {
+    return reload_channel_recommendations(channel_id);
+  }
+  auto &recommended_dialogs = channel_recommended_dialogs_[channel_id];
+  if (log_event_parse(recommended_dialogs, value).is_error()) {
+    channel_recommended_dialogs_.erase(channel_id);
+    G()->td_db()->get_sqlite_pmc()->erase(get_channel_recommendations_database_key(channel_id), Auto());
+    return reload_channel_recommendations(channel_id);
+  }
+  Dependencies dependencies;
+  for (auto dialog_id : recommended_dialogs.dialog_ids_) {
+    dependencies.add_dialog_and_dependencies(dialog_id);
+  }
+  if (!dependencies.resolve_force(td_, "on_load_channel_recommendations_from_database") ||
+      !are_suitable_recommended_dialogs(recommended_dialogs)) {
+    channel_recommended_dialogs_.erase(channel_id);
+    G()->td_db()->get_sqlite_pmc()->erase(get_channel_recommendations_database_key(channel_id), Auto());
+    return reload_channel_recommendations(channel_id);
+  }
+
+  auto next_reload_time = recommended_dialogs.next_reload_time_;
+  finish_load_channel_recommendations_queries(channel_id, recommended_dialogs.total_count_,
+                                              recommended_dialogs.dialog_ids_);
+
+  if (next_reload_time <= Time::now()) {
+    load_channel_recommendations(channel_id, false, false, Auto(), Auto());
+  }
+}
+
+void ContactsManager::reload_channel_recommendations(ChannelId channel_id) {
+  auto it = get_channel_recommendation_count_queries_[1].find(channel_id);
+  if (it != get_channel_recommendation_count_queries_[1].end()) {
+    auto promises = std::move(it->second);
+    CHECK(!promises.empty());
+    get_channel_recommendation_count_queries_[1].erase(it);
+    for (auto &promise : promises) {
+      promise.set_value(td_api::make_object<td_api::count>(-1));
+    }
+  }
+  auto query_promise =
+      PromiseCreator::lambda([actor_id = actor_id(this), channel_id](
+                                 Result<std::pair<int32, vector<tl_object_ptr<telegram_api::Chat>>>> &&result) {
+        send_closure(actor_id, &ContactsManager::on_get_channel_recommendations, channel_id, std::move(result));
+      });
+  td_->create_handler<GetChannelRecommendationsQuery>(std::move(query_promise))->send(channel_id);
+}
+
+void ContactsManager::on_get_channel_recommendations(
+    ChannelId channel_id, Result<std::pair<int32, vector<tl_object_ptr<telegram_api::Chat>>>> &&r_chats) {
+  G()->ignore_result_if_closing(r_chats);
+
+  if (r_chats.is_error()) {
+    return fail_load_channel_recommendations_queries(channel_id, r_chats.move_as_error());
+  }
+
+  auto chats = r_chats.move_as_ok();
+  auto total_count = chats.first;
+  auto channel_ids = get_channel_ids(std::move(chats.second), "on_get_channel_recommendations");
+  vector<DialogId> dialog_ids;
+  if (total_count < static_cast<int32>(channel_ids.size())) {
+    LOG(ERROR) << "Receive total_count = " << total_count << " and " << channel_ids.size() << " similar chats for "
+               << channel_id;
+    total_count = static_cast<int32>(channel_ids.size());
+  }
+  for (auto recommended_channel_id : channel_ids) {
+    auto recommended_dialog_id = DialogId(recommended_channel_id);
+    td_->messages_manager_->force_create_dialog(recommended_dialog_id, "on_get_channel_recommendations");
+    if (is_suitable_recommended_channel(recommended_channel_id)) {
+      dialog_ids.push_back(recommended_dialog_id);
+    } else {
+      total_count--;
+    }
+  }
+  auto &recommended_dialogs = channel_recommended_dialogs_[channel_id];
+  recommended_dialogs.total_count_ = total_count;
+  recommended_dialogs.dialog_ids_ = dialog_ids;
+  recommended_dialogs.next_reload_time_ = Time::now() + CHANNEL_RECOMMENDATIONS_CACHE_TIME;
+
+  if (G()->use_message_database()) {
+    G()->td_db()->get_sqlite_pmc()->set(get_channel_recommendations_database_key(channel_id),
+                                        log_event_store(recommended_dialogs).as_slice().str(), Promise<Unit>());
+  }
+
+  finish_load_channel_recommendations_queries(channel_id, total_count, std::move(dialog_ids));
+}
+
 void ContactsManager::return_created_public_dialogs(Promise<td_api::object_ptr<td_api::chats>> &&promise,
                                                     const vector<ChannelId> &channel_ids) {
   if (!promise) {
@@ -10450,8 +10894,20 @@ void ContactsManager::on_get_user(tl_object_ptr<telegram_api::User> &&user_ptr, 
   }
   on_update_user_emoji_status(u, user_id, EmojiStatus(std::move(user->emoji_status_)));
   on_update_user_accent_color_id(
-      u, user_id, ((flags2 & telegram_api::user::COLOR_MASK) != 0 ? AccentColorId(user->color_) : AccentColorId()));
-  on_update_user_background_custom_emoji_id(u, user_id, CustomEmojiId(user->background_emoji_id_));
+      u, user_id,
+      (user->color_ != nullptr && (user->color_->flags_ & telegram_api::peerColor::COLOR_MASK) != 0
+           ? AccentColorId(user->color_->color_)
+           : AccentColorId()));
+  on_update_user_background_custom_emoji_id(
+      u, user_id, (user->color_ != nullptr ? CustomEmojiId(user->color_->background_emoji_id_) : CustomEmojiId()));
+  on_update_user_profile_accent_color_id(
+      u, user_id,
+      (user->profile_color_ != nullptr && (user->profile_color_->flags_ & telegram_api::peerColor::COLOR_MASK) != 0
+           ? AccentColorId(user->profile_color_->color_)
+           : AccentColorId()));
+  on_update_user_profile_background_custom_emoji_id(
+      u, user_id,
+      (user->profile_color_ != nullptr ? CustomEmojiId(user->profile_color_->background_emoji_id_) : CustomEmojiId()));
   if (is_me_regular_user && is_received) {
     on_update_user_stories_hidden(u, user_id, stories_hidden);
   }
@@ -10769,7 +11225,7 @@ ContactsManager::User *ContactsManager::get_user_force(UserId user_id, const cha
         false /*ignored*/, false /*ignored*/, false /*ignored*/, 0, false /*ignored*/, false /*ignored*/,
         false /*ignored*/, false /*ignored*/, user_id.get(), 1, first_name, string(), username, phone_number,
         std::move(profile_photo), nullptr, bot_info_version, Auto(), string(), string(), nullptr,
-        vector<telegram_api::object_ptr<telegram_api::username>>(), 0, 0, 0);
+        vector<telegram_api::object_ptr<telegram_api::username>>(), 0, nullptr, nullptr);
     on_get_user(std::move(user), "get_user_force");
     u = get_user(user_id);
     CHECK(u != nullptr && u->is_received);
@@ -12006,6 +12462,12 @@ void ContactsManager::update_user(User *u, UserId user_id, bool from_binlog, boo
     });
     u->is_background_custom_emoji_id_changed = false;
   }
+  if (u->is_profile_accent_color_id_changed) {
+    u->is_profile_accent_color_id_changed = false;
+  }
+  if (u->is_profile_background_custom_emoji_id_changed) {
+    u->is_profile_background_custom_emoji_id_changed = false;
+  }
   if (u->is_phone_number_changed) {
     if (!u->phone_number.empty() && !td_->auth_manager_->is_bot()) {
       resolved_phone_numbers_[u->phone_number] = user_id;
@@ -12378,6 +12840,9 @@ void ContactsManager::update_channel(Channel *c, ChannelId channel_id, bool from
   if (c->had_read_access && !have_read_access) {
     send_closure_later(G()->messages_manager(), &MessagesManager::on_dialog_deleted, DialogId(channel_id),
                        Promise<Unit>());
+    if (G()->use_message_database()) {
+      G()->td_db()->get_sqlite_pmc()->erase(get_channel_recommendations_database_key(channel_id), Promise<Unit>());
+    }
   } else if (!from_database && c->was_member != is_member) {
     DialogId dialog_id(channel_id);
     send_closure_later(G()->messages_manager(), &MessagesManager::force_create_dialog, dialog_id, "update channel",
@@ -12703,6 +13168,7 @@ void ContactsManager::on_get_user_full(tl_object_ptr<telegram_api::userFull> &&u
   on_update_user_full_common_chat_count(user_full, user_id, user->common_chats_count_);
   on_update_user_full_need_phone_number_privacy_exception(user_full, user_id,
                                                           user->settings_->need_contacts_exception_);
+  on_update_user_full_wallpaper_overridden(user_full, user_id, user->wallpaper_overridden_);
 
   bool can_pin_messages = user->can_pin_message_;
   bool can_be_called = user->phone_calls_available_ && !user->phone_calls_private_;
@@ -13139,6 +13605,8 @@ void ContactsManager::on_get_chat_full(tl_object_ptr<telegram_api::ChatFull> &&c
                                                                    std::move(channel->recent_requesters_));
 
     td_->messages_manager_->on_update_dialog_message_ttl(DialogId(channel_id), MessageTtl(channel->ttl_period_));
+
+    td_->messages_manager_->on_update_dialog_view_as_messages(DialogId(channel_id), channel->view_forum_as_messages_);
 
     td_->messages_manager_->on_update_dialog_is_translatable(DialogId(channel_id), !channel->translations_disabled_);
 
@@ -13638,6 +14106,26 @@ void ContactsManager::on_update_user_background_custom_emoji_id(User *u, UserId 
   }
 }
 
+void ContactsManager::on_update_user_profile_accent_color_id(User *u, UserId user_id, AccentColorId accent_color_id) {
+  if (!accent_color_id.is_valid()) {
+    accent_color_id = AccentColorId();
+  }
+  if (u->profile_accent_color_id != accent_color_id) {
+    u->profile_accent_color_id = accent_color_id;
+    u->is_profile_accent_color_id_changed = true;
+    u->is_changed = true;
+  }
+}
+
+void ContactsManager::on_update_user_profile_background_custom_emoji_id(User *u, UserId user_id,
+                                                                        CustomEmojiId background_custom_emoji_id) {
+  if (u->profile_background_custom_emoji_id != background_custom_emoji_id) {
+    u->profile_background_custom_emoji_id = background_custom_emoji_id;
+    u->is_profile_background_custom_emoji_id_changed = true;
+    u->is_changed = true;
+  }
+}
+
 void ContactsManager::on_update_user_emoji_status(UserId user_id,
                                                   tl_object_ptr<telegram_api::EmojiStatus> &&emoji_status) {
   if (!user_id.is_valid()) {
@@ -14091,6 +14579,30 @@ void ContactsManager::on_update_user_full_need_phone_number_privacy_exception(
   }
 }
 
+void ContactsManager::on_update_user_wallpaper_overridden(UserId user_id, bool wallpaper_overridden) {
+  LOG(INFO) << "Receive " << wallpaper_overridden << " set chat background for " << user_id;
+  if (!user_id.is_valid()) {
+    LOG(ERROR) << "Receive invalid " << user_id;
+    return;
+  }
+
+  UserFull *user_full = get_user_full_force(user_id);
+  if (user_full == nullptr) {
+    return;
+  }
+  on_update_user_full_wallpaper_overridden(user_full, user_id, wallpaper_overridden);
+  update_user_full(user_full, user_id, "on_update_user_wallpaper_overridden");
+}
+
+void ContactsManager::on_update_user_full_wallpaper_overridden(UserFull *user_full, UserId user_id,
+                                                               bool wallpaper_overridden) const {
+  CHECK(user_full != nullptr);
+  if (user_full->wallpaper_overridden != wallpaper_overridden) {
+    user_full->wallpaper_overridden = wallpaper_overridden;
+    user_full->is_changed = true;
+  }
+}
+
 void ContactsManager::on_ignored_restriction_reasons_changed() {
   restricted_user_ids_.foreach([&](const UserId &user_id) {
     send_closure(G()->td(), &Td::send_update, get_update_user_object(user_id, get_user(user_id)));
@@ -14385,6 +14897,7 @@ void ContactsManager::drop_user_full(UserId user_id) {
   user_full->supports_video_calls = false;
   user_full->has_private_calls = false;
   user_full->need_phone_number_privacy_exception = false;
+  user_full->wallpaper_overridden = false;
   user_full->about = string();
   user_full->description = string();
   user_full->description_photo = Photo();
@@ -15022,7 +15535,7 @@ void ContactsManager::speculative_delete_channel_participant(ChannelId channel_i
 void ContactsManager::speculative_add_channel_participant_count(ChannelId channel_id, int32 delta_participant_count,
                                                                 bool by_me) {
   if (by_me) {
-    // Currently ignore all changes made by the current user, because they may be already counted
+    // Currently, ignore all changes made by the current user, because they may have been already counted
     invalidate_channel_full(channel_id, false, "speculative_add_channel_participant_count");  // just in case
     return;
   }
@@ -19112,7 +19625,11 @@ void ContactsManager::on_get_channel(telegram_api::channel &channel, const char 
         c->is_scam = is_scam;
         c->is_fake = is_fake;
         c->is_gigagroup = is_gigagroup;
-        c->is_forum = is_forum;
+        if (c->is_forum != is_forum) {
+          c->is_forum = is_forum;
+          send_closure_later(G()->messages_manager(), &MessagesManager::on_update_dialog_is_forum, DialogId(channel_id),
+                             is_forum);
+        }
 
         c->is_changed = true;
         invalidate_channel_full(channel_id, !c->is_slow_mode_enabled, "on_get_min_channel");
@@ -19145,8 +19662,8 @@ void ContactsManager::on_get_channel(telegram_api::channel &channel, const char 
       if (td_->auth_manager_->is_bot()) {
         min_channel->photo_.minithumbnail.clear();
       }
-      if ((channel.flags2_ & telegram_api::channel::COLOR_MASK) != 0) {
-        min_channel->accent_color_id_ = AccentColorId(channel.color_);
+      if (channel.color_ != nullptr && (channel.color_->flags_ & telegram_api::peerColor::COLOR_MASK) != 0) {
+        min_channel->accent_color_id_ = AccentColorId(channel.color_->color_);
       }
       min_channel->title_ = std::move(channel.title_);
       min_channel->is_megagroup_ = is_megagroup;
@@ -19194,7 +19711,11 @@ void ContactsManager::on_get_channel(telegram_api::channel &channel, const char 
     c->is_scam = is_scam;
     c->is_fake = is_fake;
     c->is_gigagroup = is_gigagroup;
-    c->is_forum = is_forum;
+    if (c->is_forum != is_forum) {
+      c->is_forum = is_forum;
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_update_dialog_is_forum, DialogId(channel_id),
+                         is_forum);
+    }
 
     c->is_changed = true;
     need_invalidate_channel_full = true;
@@ -19219,8 +19740,11 @@ void ContactsManager::on_get_channel(telegram_api::channel &channel, const char 
   on_update_channel_photo(c, channel_id, std::move(channel.photo_));
   on_update_channel_accent_color_id(
       c, channel_id,
-      ((channel.flags2_ & telegram_api::channel::COLOR_MASK) != 0 ? AccentColorId(channel.color_) : AccentColorId()));
-  on_update_channel_background_custom_emoji_id(c, channel_id, CustomEmojiId(channel.background_emoji_id_));
+      (channel.color_ != nullptr && (channel.color_->flags_ & telegram_api::peerColor::COLOR_MASK) != 0
+           ? AccentColorId(channel.color_->color_)
+           : AccentColorId()));
+  on_update_channel_background_custom_emoji_id(
+      c, channel_id, channel.color_ != nullptr ? CustomEmojiId(channel.color_->background_emoji_id_) : CustomEmojiId());
   on_update_channel_status(c, channel_id, std::move(status));
   on_update_channel_usernames(
       c, channel_id,
@@ -19488,9 +20012,9 @@ td_api::object_ptr<td_api::updateUser> ContactsManager::get_update_unknown_user_
   auto have_access = user_id == get_my_id() || user_messages_.count(user_id) != 0;
   return td_api::make_object<td_api::updateUser>(td_api::make_object<td_api::user>(
       user_id.get(), "", "", nullptr, "", td_api::make_object<td_api::userStatusEmpty>(), nullptr,
-      td_->theme_manager_->get_accent_color_id_object(AccentColorId(user_id)), 0, nullptr, false, false, false, false,
-      false, false, "", false, false, false, false, have_access, td_api::make_object<td_api::userTypeUnknown>(), "",
-      false));
+      td_->theme_manager_->get_accent_color_id_object(AccentColorId(user_id)), 0, -1, 0, nullptr, false, false, false,
+      false, false, false, "", false, false, false, false, have_access, td_api::make_object<td_api::userTypeUnknown>(),
+      "", false));
 }
 
 int64 ContactsManager::get_user_id_object(UserId user_id, const char *source) const {
@@ -19530,7 +20054,9 @@ tl_object_ptr<td_api::user> ContactsManager::get_user_object(UserId user_id, con
       get_user_status_object(user_id, u, G()->unix_time()),
       get_profile_photo_object(td_->file_manager_.get(), u->photo),
       td_->theme_manager_->get_accent_color_id_object(accent_color_id, AccentColorId(user_id)),
-      u->background_custom_emoji_id.get(), std::move(emoji_status), u->is_contact, u->is_mutual_contact,
+      u->background_custom_emoji_id.get(),
+      td_->theme_manager_->get_profile_accent_color_id_object(u->profile_accent_color_id),
+      u->profile_background_custom_emoji_id.get(), std::move(emoji_status), u->is_contact, u->is_mutual_contact,
       u->is_close_friend, u->is_verified, u->is_premium, u->is_support,
       get_restriction_reason_description(u->restriction_reasons), u->is_scam, u->is_fake,
       u->max_active_story_id.is_valid(), get_user_has_unread_stories(u), have_access, std::move(type), u->language_code,
@@ -19614,7 +20140,7 @@ tl_object_ptr<td_api::userFullInfo> ContactsManager::get_user_full_info_object(U
       get_chat_photo_object(td_->file_manager_.get(), user_full->fallback_photo), block_list_id.get_block_list_object(),
       user_full->can_be_called, user_full->supports_video_calls, user_full->has_private_calls,
       !user_full->private_forward_name.empty(), voice_messages_forbidden, user_full->has_pinned_stories,
-      user_full->need_phone_number_privacy_exception, std::move(bio_object),
+      user_full->need_phone_number_privacy_exception, user_full->wallpaper_overridden, std::move(bio_object),
       get_premium_payment_options_object(user_full->premium_gift_options), user_full->common_chat_count,
       std::move(bot_info));
 }

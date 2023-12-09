@@ -15,6 +15,7 @@
 #include "td/telegram/BackgroundInfo.hpp"
 #include "td/telegram/CallDiscardReason.h"
 #include "td/telegram/ChannelId.h"
+#include "td/telegram/ChannelType.h"
 #include "td/telegram/ChatId.h"
 #include "td/telegram/Contact.h"
 #include "td/telegram/ContactsManager.h"
@@ -79,6 +80,7 @@
 #include "td/telegram/Td.h"
 #include "td/telegram/telegram_api.h"
 #include "td/telegram/TopDialogManager.h"
+#include "td/telegram/TranscriptionManager.h"
 #include "td/telegram/UserId.h"
 #include "td/telegram/Venue.h"
 #include "td/telegram/Version.h"
@@ -496,7 +498,7 @@ class MessageChatSetTtl final : public MessageContent {
 
 class MessageUnsupported final : public MessageContent {
  public:
-  static constexpr int32 CURRENT_VERSION = 24;
+  static constexpr int32 CURRENT_VERSION = 25;
   int32 version = CURRENT_VERSION;
 
   MessageUnsupported() = default;
@@ -925,10 +927,11 @@ class MessageSetBackground final : public MessageContent {
  public:
   MessageId old_message_id;
   BackgroundInfo background_info;
+  bool for_both = false;
 
   MessageSetBackground() = default;
-  MessageSetBackground(MessageId old_message_id, BackgroundInfo background_info)
-      : old_message_id(old_message_id), background_info(std::move(background_info)) {
+  MessageSetBackground(MessageId old_message_id, BackgroundInfo background_info, bool for_both)
+      : old_message_id(old_message_id), background_info(std::move(background_info)), for_both(for_both) {
   }
 
   MessageContentType get_type() const final {
@@ -1001,6 +1004,22 @@ class MessageGiveawayLaunch final : public MessageContent {
 
   MessageContentType get_type() const final {
     return MessageContentType::GiveawayLaunch;
+  }
+};
+
+class MessageGiveawayResults final : public MessageContent {
+ public:
+  MessageId giveaway_message_id;
+  int32 winner_count = 0;
+  int32 unclaimed_count = 0;
+
+  MessageGiveawayResults() = default;
+  MessageGiveawayResults(MessageId giveaway_message_id, int32 winner_count, int32 unclaimed_count)
+      : giveaway_message_id(giveaway_message_id), winner_count(winner_count), unclaimed_count(unclaimed_count) {
+  }
+
+  MessageContentType get_type() const final {
+    return MessageContentType::GiveawayResults;
   }
 };
 
@@ -1403,6 +1422,7 @@ static void store(const MessageContent *content, StorerT &storer) {
       bool has_message_id = m->old_message_id.is_valid();
       BEGIN_STORE_FLAGS();
       STORE_FLAG(has_message_id);
+      STORE_FLAG(m->for_both);
       END_STORE_FLAGS();
       if (has_message_id) {
         store(m->old_message_id, storer);
@@ -1446,6 +1466,27 @@ static void store(const MessageContent *content, StorerT &storer) {
     }
     case MessageContentType::GiveawayLaunch:
       break;
+    case MessageContentType::GiveawayResults: {
+      const auto *m = static_cast<const MessageGiveawayResults *>(content);
+      bool has_winner_count = m->winner_count != 0;
+      bool has_unclaimed_count = m->unclaimed_count != 0;
+      bool has_giveaway_message_id = m->giveaway_message_id.is_valid();
+      BEGIN_STORE_FLAGS();
+      STORE_FLAG(has_winner_count);
+      STORE_FLAG(has_unclaimed_count);
+      STORE_FLAG(has_giveaway_message_id);
+      END_STORE_FLAGS();
+      if (has_winner_count) {
+        store(m->winner_count, storer);
+      }
+      if (has_unclaimed_count) {
+        store(m->unclaimed_count, storer);
+      }
+      if (has_giveaway_message_id) {
+        store(m->giveaway_message_id, storer);
+      }
+      break;
+    }
     default:
       UNREACHABLE();
   }
@@ -1985,6 +2026,7 @@ static void parse(unique_ptr<MessageContent> &content, ParserT &parser) {
       bool has_message_id;
       BEGIN_PARSE_FLAGS();
       PARSE_FLAG(has_message_id);
+      PARSE_FLAG(m->for_both);
       END_PARSE_FLAGS();
       if (has_message_id) {
         parse(m->old_message_id, parser);
@@ -2040,6 +2082,31 @@ static void parse(unique_ptr<MessageContent> &content, ParserT &parser) {
     case MessageContentType::GiveawayLaunch:
       content = make_unique<MessageGiveawayLaunch>();
       break;
+    case MessageContentType::GiveawayResults: {
+      auto m = make_unique<MessageGiveawayResults>();
+      bool has_winner_count;
+      bool has_unclaimed_count;
+      bool has_giveaway_message_id;
+      BEGIN_PARSE_FLAGS();
+      PARSE_FLAG(has_winner_count);
+      PARSE_FLAG(has_unclaimed_count);
+      PARSE_FLAG(has_giveaway_message_id);
+      END_PARSE_FLAGS();
+      if (has_winner_count) {
+        parse(m->winner_count, parser);
+      }
+      if (has_unclaimed_count) {
+        parse(m->unclaimed_count, parser);
+      }
+      if (has_giveaway_message_id) {
+        parse(m->giveaway_message_id, parser);
+      }
+      if (m->winner_count < 0 || m->unclaimed_count < 0) {
+        is_bad = true;
+      }
+      content = std::move(m);
+      break;
+    }
 
     default:
       is_bad = true;
@@ -2697,6 +2764,7 @@ bool can_have_input_media(const Td *td, const MessageContent *content, bool is_s
     case MessageContentType::WriteAccessAllowedByRequest:
     case MessageContentType::GiftCode:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       return false;
     case MessageContentType::Animation:
     case MessageContentType::Audio:
@@ -2833,6 +2901,7 @@ SecretInputMedia get_secret_input_media(const MessageContent *content, Td *td,
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       break;
     default:
       UNREACHABLE();
@@ -2969,6 +3038,7 @@ static tl_object_ptr<telegram_api::InputMedia> get_input_media_impl(
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       break;
     default:
       UNREACHABLE();
@@ -3169,15 +3239,21 @@ void delete_message_content_thumbnail(MessageContent *content, Td *td) {
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       break;
     default:
       UNREACHABLE();
   }
 }
 
-Status can_send_message_content(DialogId dialog_id, const MessageContent *content, bool is_forward, const Td *td) {
+Status can_send_message_content(DialogId dialog_id, const MessageContent *content, bool is_forward,
+                                bool check_permissions, const Td *td) {
   auto dialog_type = dialog_id.get_type();
   RestrictedRights permissions = [&] {
+    if (!check_permissions) {
+      return RestrictedRights(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                              true, true, ChannelType::Unknown);
+    }
     switch (dialog_type) {
       case DialogType::User:
         return td->contacts_manager_->get_user_default_permissions(dialog_id.get_user_id());
@@ -3377,6 +3453,7 @@ Status can_send_message_content(DialogId dialog_id, const MessageContent *conten
     case MessageContentType::WriteAccessAllowedByRequest:
     case MessageContentType::GiftCode:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       UNREACHABLE();
   }
   return Status::OK();
@@ -3519,6 +3596,7 @@ static int32 get_message_content_media_index_mask(const MessageContent *content,
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       return 0;
     default:
       UNREACHABLE();
@@ -3545,13 +3623,19 @@ MessageId get_message_content_pinned_message_id(const MessageContent *content) {
   }
 }
 
-BackgroundInfo get_message_content_background_info(const MessageContent *content) {
+BackgroundInfo get_message_content_my_background_info(const MessageContent *content, bool is_outgoing) {
   switch (content->get_type()) {
-    case MessageContentType::SetBackground:
-      return static_cast<const MessageSetBackground *>(content)->background_info;
+    case MessageContentType::SetBackground: {
+      const auto *set_background = static_cast<const MessageSetBackground *>(content);
+      if (is_outgoing || set_background->for_both) {
+        return set_background->background_info;
+      }
+      break;
+    }
     default:
-      return BackgroundInfo();
+      break;
   }
+  return BackgroundInfo();
 }
 
 string get_message_content_theme_name(const MessageContent *content) {
@@ -3585,6 +3669,14 @@ MessageFullId get_message_content_replied_message_id(DialogId dialog_id, const M
       }
 
       return {dialog_id, m->old_message_id};
+    }
+    case MessageContentType::GiveawayResults: {
+      auto *m = static_cast<const MessageGiveawayResults *>(content);
+      if (!m->giveaway_message_id.is_valid()) {
+        return MessageFullId();
+      }
+
+      return {dialog_id, m->giveaway_message_id};
     }
     default:
       return MessageFullId();
@@ -3752,6 +3844,8 @@ vector<UserId> get_message_content_min_user_ids(const Td *td, const MessageConte
     case MessageContentType::Giveaway:
       break;
     case MessageContentType::GiveawayLaunch:
+      break;
+    case MessageContentType::GiveawayResults:
       break;
     default:
       UNREACHABLE();
@@ -3944,6 +4038,17 @@ static bool need_message_entities_changed_warning(const vector<MessageEntity> &o
       new_pos++;
       continue;
     }
+    if (old_pos < old_entities.size() && new_pos < new_entities.size() &&
+        (old_entities[old_pos].type == MessageEntity::Type::Pre ||
+         old_entities[old_pos].type == MessageEntity::Type::PreCode) &&
+        new_entities[new_pos].type == MessageEntity::Type::PreCode && old_entities[old_pos].argument.empty() &&
+        old_entities[old_pos].offset == new_entities[new_pos].offset &&
+        old_entities[old_pos].length == new_entities[new_pos].length) {
+      // server can add recognized language code
+      old_pos++;
+      new_pos++;
+      continue;
+    }
 
     if (old_pos < old_entities.size() && (old_entities[old_pos].type == MessageEntity::Type::MentionName ||
                                           old_entities[old_pos].type == MessageEntity::Type::CustomEmoji)) {
@@ -4132,6 +4237,7 @@ void merge_message_contents(Td *td, const MessageContent *old_content, MessageCo
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       break;
     default:
       UNREACHABLE();
@@ -4277,6 +4383,7 @@ bool merge_message_content_file_id(Td *td, MessageContent *message_content, File
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       LOG(ERROR) << "Receive new file " << new_file_id << " in a sent message of the type " << content_type;
       break;
     default:
@@ -4738,7 +4845,8 @@ void compare_message_contents(Td *td, const MessageContent *old_content, const M
     case MessageContentType::SetBackground: {
       const auto *lhs = static_cast<const MessageSetBackground *>(old_content);
       const auto *rhs = static_cast<const MessageSetBackground *>(new_content);
-      if (lhs->old_message_id != rhs->old_message_id || lhs->background_info != rhs->background_info) {
+      if (lhs->old_message_id != rhs->old_message_id || lhs->background_info != rhs->background_info ||
+          lhs->for_both != rhs->for_both) {
         need_update = true;
       }
       break;
@@ -4773,6 +4881,15 @@ void compare_message_contents(Td *td, const MessageContent *old_content, const M
     }
     case MessageContentType::GiveawayLaunch:
       break;
+    case MessageContentType::GiveawayResults: {
+      const auto *lhs = static_cast<const MessageGiveawayResults *>(old_content);
+      const auto *rhs = static_cast<const MessageGiveawayResults *>(new_content);
+      if (lhs->giveaway_message_id != rhs->giveaway_message_id || lhs->winner_count != rhs->winner_count ||
+          lhs->unclaimed_count != rhs->unclaimed_count) {
+        need_update = true;
+      }
+      break;
+    }
     default:
       UNREACHABLE();
       break;
@@ -4800,7 +4917,8 @@ static CustomEmojiId get_custom_emoji_id(const FormattedText &text) {
 
 void register_message_content(Td *td, const MessageContent *content, MessageFullId message_full_id,
                               const char *source) {
-  switch (content->get_type()) {
+  auto content_type = content->get_type();
+  switch (content_type) {
     case MessageContentType::Text: {
       auto text = static_cast<const MessageText *>(content);
       if (text->web_page_id.is_valid()) {
@@ -4812,11 +4930,11 @@ void register_message_content(Td *td, const MessageContent *content, MessageFull
       return;
     }
     case MessageContentType::VideoNote:
-      return td->video_notes_manager_->register_video_note(static_cast<const MessageVideoNote *>(content)->file_id,
-                                                           message_full_id, source);
+      return td->transcription_manager_->register_voice(static_cast<const MessageVideoNote *>(content)->file_id,
+                                                        content_type, message_full_id, source);
     case MessageContentType::VoiceNote:
-      return td->voice_notes_manager_->register_voice_note(static_cast<const MessageVoiceNote *>(content)->file_id,
-                                                           message_full_id, source);
+      return td->transcription_manager_->register_voice(static_cast<const MessageVoiceNote *>(content)->file_id,
+                                                        content_type, message_full_id, source);
     case MessageContentType::Poll:
       return td->poll_manager_->register_poll(static_cast<const MessagePoll *>(content)->poll_id, message_full_id,
                                               source);
@@ -4920,7 +5038,8 @@ void reregister_message_content(Td *td, const MessageContent *old_content, const
 
 void unregister_message_content(Td *td, const MessageContent *content, MessageFullId message_full_id,
                                 const char *source) {
-  switch (content->get_type()) {
+  auto content_type = content->get_type();
+  switch (content_type) {
     case MessageContentType::Text: {
       auto text = static_cast<const MessageText *>(content);
       if (text->web_page_id.is_valid()) {
@@ -4932,11 +5051,11 @@ void unregister_message_content(Td *td, const MessageContent *content, MessageFu
       return;
     }
     case MessageContentType::VideoNote:
-      return td->video_notes_manager_->unregister_video_note(static_cast<const MessageVideoNote *>(content)->file_id,
-                                                             message_full_id, source);
+      return td->transcription_manager_->unregister_voice(static_cast<const MessageVideoNote *>(content)->file_id,
+                                                          content_type, message_full_id, source);
     case MessageContentType::VoiceNote:
-      return td->voice_notes_manager_->unregister_voice_note(static_cast<const MessageVoiceNote *>(content)->file_id,
-                                                             message_full_id, source);
+      return td->transcription_manager_->unregister_voice(static_cast<const MessageVoiceNote *>(content)->file_id,
+                                                          content_type, message_full_id, source);
     case MessageContentType::Poll:
       return td->poll_manager_->unregister_poll(static_cast<const MessagePoll *>(content)->poll_id, message_full_id,
                                                 source);
@@ -5390,8 +5509,9 @@ unique_ptr<MessageContent> get_secret_message_content(
 
 unique_ptr<MessageContent> get_message_content(Td *td, FormattedText message,
                                                tl_object_ptr<telegram_api::MessageMedia> &&media_ptr,
-                                               DialogId owner_dialog_id, bool is_content_read, UserId via_bot_user_id,
-                                               int32 *ttl, bool *disable_web_page_preview, const char *source) {
+                                               DialogId owner_dialog_id, int32 message_date, bool is_content_read,
+                                               UserId via_bot_user_id, int32 *ttl, bool *disable_web_page_preview,
+                                               const char *source) {
   if (!td->auth_manager_->was_authorized() && !G()->close_flag() && media_ptr != nullptr &&
       media_ptr->get_id() != telegram_api::messageMediaEmpty::ID) {
     LOG(ERROR) << "Receive without authorization from " << source << ": " << to_string(media_ptr);
@@ -5582,7 +5702,9 @@ unique_ptr<MessageContent> get_message_content(Td *td, FormattedText message,
         }
       }
       if (channel_ids.empty() || media->quantity_ <= 0 || media->months_ <= 0 || media->until_date_ < 0) {
-        LOG(ERROR) << "Receive " << to_string(media);
+        if (message_date >= 1700000000) {  // approximate release date
+          LOG(ERROR) << "Receive " << to_string(media);
+        }
         break;
       }
       auto boosted_channel_id = channel_ids[0];
@@ -5873,6 +5995,7 @@ unique_ptr<MessageContent> dup_message_content(Td *td, DialogId dialog_id, const
     case MessageContentType::WriteAccessAllowedByRequest:
     case MessageContentType::GiftCode:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       return nullptr;
     default:
       UNREACHABLE();
@@ -5882,7 +6005,7 @@ unique_ptr<MessageContent> dup_message_content(Td *td, DialogId dialog_id, const
 }
 
 unique_ptr<MessageContent> get_action_message_content(Td *td, tl_object_ptr<telegram_api::MessageAction> &&action_ptr,
-                                                      DialogId owner_dialog_id,
+                                                      DialogId owner_dialog_id, int32 message_date,
                                                       const RepliedMessageInfo &replied_message_info) {
   CHECK(action_ptr != nullptr);
 
@@ -6222,19 +6345,11 @@ unique_ptr<MessageContent> get_action_message_content(Td *td, tl_object_ptr<tele
       if (!background_info.is_valid()) {
         break;
       }
-      return make_unique<MessageSetBackground>(MessageId(), std::move(background_info));
-    }
-    case telegram_api::messageActionSetSameChatWallPaper::ID: {
-      auto action = move_tl_object_as<telegram_api::messageActionSetSameChatWallPaper>(action_ptr);
-      BackgroundInfo background_info(td, std::move(action->wallpaper_));
-      if (!background_info.is_valid()) {
-        break;
-      }
       auto reply_to_message_id = replied_message_info.get_same_chat_reply_to_message_id(true);
-      if (!reply_to_message_id.is_valid()) {
+      if (!reply_to_message_id.is_valid() || !action->same_) {
         reply_to_message_id = MessageId();
       }
-      return make_unique<MessageSetBackground>(reply_to_message_id, std::move(background_info));
+      return make_unique<MessageSetBackground>(reply_to_message_id, std::move(background_info), action->for_both_);
     }
     case telegram_api::messageActionGiveawayLaunch::ID:
       return make_unique<MessageGiveawayLaunch>();
@@ -6253,6 +6368,18 @@ unique_ptr<MessageContent> get_action_message_content(Td *td, tl_object_ptr<tele
       }
       return td::make_unique<MessageGiftCode>(dialog_id, action->months_, action->via_giveaway_, action->unclaimed_,
                                               std::move(action->slug_));
+    }
+    case telegram_api::messageActionGiveawayResults::ID: {
+      auto action = move_tl_object_as<telegram_api::messageActionGiveawayResults>(action_ptr);
+      auto reply_to_message_id = replied_message_info.get_same_chat_reply_to_message_id(true);
+      if (!reply_to_message_id.is_valid()) {
+        if (message_date >= 1700000000) {  // approximate release date
+          LOG(ERROR) << "Receive giveaway results message with " << reply_to_message_id << " in " << owner_dialog_id;
+        }
+        reply_to_message_id = MessageId();
+      }
+      return td::make_unique<MessageGiveawayResults>(reply_to_message_id, action->winners_count_,
+                                                     action->unclaimed_count_);
     }
     default:
       UNREACHABLE();
@@ -6611,8 +6738,8 @@ tl_object_ptr<td_api::MessageContent> get_message_content_object(const MessageCo
     }
     case MessageContentType::SetBackground: {
       const auto *m = static_cast<const MessageSetBackground *>(content);
-      return td_api::make_object<td_api::messageChatSetBackground>(m->old_message_id.get(),
-                                                                   m->background_info.get_chat_background_object(td));
+      return td_api::make_object<td_api::messageChatSetBackground>(
+          m->old_message_id.get(), m->background_info.get_chat_background_object(td), !m->for_both);
     }
     case MessageContentType::Story: {
       const auto *m = static_cast<const MessageStory *>(content);
@@ -6637,6 +6764,11 @@ tl_object_ptr<td_api::MessageContent> get_message_content_object(const MessageCo
     }
     case MessageContentType::GiveawayLaunch:
       return td_api::make_object<td_api::messagePremiumGiveawayCreated>();
+    case MessageContentType::GiveawayResults: {
+      const auto *m = static_cast<const MessageGiveawayResults *>(content);
+      return td_api::make_object<td_api::messagePremiumGiveawayCompleted>(m->giveaway_message_id.get(), m->winner_count,
+                                                                          m->unclaimed_count);
+    }
     default:
       UNREACHABLE();
       return nullptr;
@@ -7067,6 +7199,7 @@ string get_message_content_search_text(const Td *td, const MessageContent *conte
     case MessageContentType::GiftCode:
     case MessageContentType::Giveaway:
     case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       return string();
     default:
       UNREACHABLE();
@@ -7387,6 +7520,8 @@ void add_message_content_dependencies(Dependencies &dependencies, const MessageC
     }
     case MessageContentType::GiveawayLaunch:
       break;
+    case MessageContentType::GiveawayResults:
+      break;
     default:
       UNREACHABLE();
       break;
@@ -7489,30 +7624,6 @@ void update_used_hashtags(Td *td, const MessageContent *content) {
     auto to = ptr;
 
     send_closure(td->hashtag_hints_, &HashtagHints::hashtag_used, Slice(from + 1, to).str());
-  }
-}
-
-void recognize_message_content_speech(Td *td, const MessageContent *content, MessageFullId message_full_id,
-                                      Promise<Unit> &&promise) {
-  switch (content->get_type()) {
-    case MessageContentType::VideoNote:
-      return td->video_notes_manager_->recognize_speech(message_full_id, std::move(promise));
-    case MessageContentType::VoiceNote:
-      return td->voice_notes_manager_->recognize_speech(message_full_id, std::move(promise));
-    default:
-      return promise.set_error(Status::Error(400, "Invalid message specified"));
-  }
-}
-
-void rate_message_content_speech_recognition(Td *td, const MessageContent *content, MessageFullId message_full_id,
-                                             bool is_good, Promise<Unit> &&promise) {
-  switch (content->get_type()) {
-    case MessageContentType::VideoNote:
-      return td->video_notes_manager_->rate_speech_recognition(message_full_id, is_good, std::move(promise));
-    case MessageContentType::VoiceNote:
-      return td->voice_notes_manager_->rate_speech_recognition(message_full_id, is_good, std::move(promise));
-    default:
-      return promise.set_error(Status::Error(400, "Invalid message specified"));
   }
 }
 

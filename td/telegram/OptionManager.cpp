@@ -149,6 +149,9 @@ OptionManager::OptionManager(Td *td)
   if (!have_option("premium_gift_boost_count")) {
     set_option_integer("premium_gift_boost_count", 3);
   }
+  if (!have_option("chat_boost_level_max")) {
+    set_option_integer("chat_boost_level_max", G()->is_test_dc() ? 10 : 100);
+  }
 
   set_option_empty("archive_and_mute_new_chats_from_unknown_users");
   set_option_empty("chat_filter_count_max");
@@ -327,6 +330,7 @@ bool OptionManager::is_internal_option(Slice name) {
     case 'r':
       return name == "rating_e_decay" || name == "reactions_uniq_max" || name == "reactions_user_max_default" ||
              name == "reactions_user_max_premium" || name == "recent_stickers_limit" ||
+             name == "recommended_channels_limit_default" || name == "recommended_channels_limit_premium" ||
              name == "restriction_add_platforms" || name == "revoke_pm_inbox" || name == "revoke_time_limit" ||
              name == "revoke_pm_time_limit";
     case 's':
@@ -590,7 +594,7 @@ td_api::object_ptr<td_api::OptionValue> OptionManager::get_option_synchronously(
       break;
     case 'v':
       if (name == "version") {
-        return td_api::make_object<td_api::optionValueString>("1.8.21");
+        return td_api::make_object<td_api::optionValueString>("1.8.22");
       }
       break;
   }

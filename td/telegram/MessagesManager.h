@@ -178,6 +178,10 @@ class MessagesManager final : public Actor {
 
   void get_channel_differences_if_needed(MessagesInfo &&messages_info, Promise<MessagesInfo> &&promise);
 
+  void get_channel_differences_if_needed(
+      telegram_api::object_ptr<telegram_api::stats_publicForwards> &&public_forwards,
+      Promise<telegram_api::object_ptr<telegram_api::stats_publicForwards>> &&promise);
+
   void on_get_messages(vector<tl_object_ptr<telegram_api::Message>> &&messages, bool is_channel_message,
                        bool is_scheduled, Promise<Unit> &&promise, const char *source);
 
@@ -273,6 +277,10 @@ class MessagesManager final : public Actor {
   void on_update_dialog_is_pinned(FolderId folder_id, DialogId dialog_id, bool is_pinned);
 
   void on_update_pinned_dialogs(FolderId folder_id);
+
+  void on_update_dialog_is_forum(DialogId dialog_id, bool is_forum);
+
+  void on_update_dialog_view_as_messages(DialogId dialog_id, bool view_as_messages);
 
   void on_update_dialog_is_marked_as_unread(DialogId dialog_id, bool is_marked_as_unread);
 
@@ -466,7 +474,7 @@ class MessagesManager final : public Actor {
       vector<MessageCopyOptions> &&copy_options) TD_WARN_UNUSED_RESULT;
 
   Result<vector<MessageId>> resend_messages(DialogId dialog_id, vector<MessageId> message_ids,
-                                            td_api::object_ptr<td_api::formattedText> &&quote) TD_WARN_UNUSED_RESULT;
+                                            td_api::object_ptr<td_api::inputTextQuote> &&quote) TD_WARN_UNUSED_RESULT;
 
   void set_dialog_message_ttl(DialogId dialog_id, int32 ttl, Promise<Unit> &&promise);
 
@@ -665,10 +673,6 @@ class MessagesManager final : public Actor {
   void translate_message_text(MessageFullId message_full_id, const string &to_language_code,
                               Promise<td_api::object_ptr<td_api::formattedText>> &&promise);
 
-  void recognize_speech(MessageFullId message_full_id, Promise<Unit> &&promise);
-
-  void rate_speech_recognition(MessageFullId message_full_id, bool is_good, Promise<Unit> &&promise);
-
   bool is_message_edited_recently(MessageFullId message_full_id, int32 seconds);
 
   bool is_deleted_secret_chat(DialogId dialog_id) const;
@@ -698,6 +702,8 @@ class MessagesManager final : public Actor {
   void clear_all_draft_messages(bool exclude_secret_chats, Promise<Unit> &&promise);
 
   Status toggle_dialog_is_pinned(DialogListId dialog_list_id, DialogId dialog_id, bool is_pinned) TD_WARN_UNUSED_RESULT;
+
+  Status toggle_dialog_view_as_messages(DialogId dialog_id, bool view_as_messages) TD_WARN_UNUSED_RESULT;
 
   Status toggle_dialog_is_marked_as_unread(DialogId dialog_id, bool is_marked_as_unread) TD_WARN_UNUSED_RESULT;
 
@@ -1386,6 +1392,8 @@ class MessagesManager final : public Actor {
     bool is_folder_id_inited = false;
     bool need_repair_server_unread_count = false;
     bool need_repair_channel_server_unread_count = false;
+    bool is_forum = false;
+    bool view_as_messages = false;
     bool is_marked_as_unread = false;
     bool is_blocked = false;
     bool is_is_blocked_inited = false;
@@ -1403,6 +1411,7 @@ class MessagesManager final : public Actor {
     bool is_message_ttl_inited = false;
     bool has_expected_active_group_call_id = false;
     bool has_bots = false;
+    bool is_view_as_messages_inited = false;
     bool is_has_bots_inited = false;
     bool is_background_inited = false;
     bool is_theme_name_inited = false;
@@ -1670,6 +1679,7 @@ class MessagesManager final : public Actor {
   class SendScreenshotTakenNotificationMessageLogEvent;
   class SetDialogFolderIdOnServerLogEvent;
   class ToggleDialogIsBlockedOnServerLogEvent;
+  class ToggleDialogViewAsMessagesOnServerLogEvent;
   class ToggleDialogIsMarkedAsUnreadOnServerLogEvent;
   class ToggleDialogIsTranslatableOnServerLogEvent;
   class ToggleDialogIsPinnedOnServerLogEvent;
@@ -1785,7 +1795,8 @@ class MessagesManager final : public Actor {
                                const char *source);
 
   Result<InputMessageContent> process_input_message_content(
-      DialogId dialog_id, tl_object_ptr<td_api::InputMessageContent> &&input_message_content);
+      DialogId dialog_id, tl_object_ptr<td_api::InputMessageContent> &&input_message_content,
+      bool check_permissions = true);
 
   Result<MessageCopyOptions> process_message_copy_options(DialogId dialog_id,
                                                           tl_object_ptr<td_api::messageCopyOptions> &&options) const;
@@ -2445,7 +2456,7 @@ class MessagesManager final : public Actor {
 
   void send_update_new_chat(Dialog *d);
 
-  bool need_hide_dialog_draft_message(DialogId dialog_id) const;
+  bool need_hide_dialog_draft_message(const Dialog *d) const;
 
   void send_update_chat_draft_message(const Dialog *d);
 
@@ -2578,6 +2589,12 @@ class MessagesManager final : public Actor {
 
   void save_pinned_folder_dialog_ids(const DialogList &list) const;
 
+  void on_update_dialog_view_as_topics(const Dialog *d, bool old_view_as_topics);
+
+  void set_dialog_is_forum(Dialog *d, bool is_forum);
+
+  void set_dialog_view_as_messages(Dialog *d, bool view_as_messages);
+
   void set_dialog_is_marked_as_unread(Dialog *d, bool is_marked_as_unread);
 
   void set_dialog_is_translatable(Dialog *d, bool is_translatable);
@@ -2613,6 +2630,8 @@ class MessagesManager final : public Actor {
   void do_set_dialog_folder_id(Dialog *d, FolderId folder_id);
 
   void toggle_dialog_is_pinned_on_server(DialogId dialog_id, bool is_pinned, uint64 log_event_id);
+
+  void toggle_dialog_view_as_messages_on_server(DialogId dialog_id, bool view_as_messages, uint64 log_event_id);
 
   void toggle_dialog_is_marked_as_unread_on_server(DialogId dialog_id, bool is_marked_as_unread, uint64 log_event_id);
 
@@ -2974,6 +2993,8 @@ class MessagesManager final : public Actor {
 
   bool get_dialog_has_protected_content(DialogId dialog_id) const;
 
+  bool get_dialog_view_as_topics(const Dialog *d) const;
+
   bool get_dialog_has_scheduled_messages(const Dialog *d) const;
 
   static DialogScheduledMessages *add_dialog_scheduled_messages(Dialog *d);
@@ -3228,6 +3249,8 @@ class MessagesManager final : public Actor {
   static uint64 save_toggle_dialog_is_pinned_on_server_log_event(DialogId dialog_id, bool is_pinned);
 
   static uint64 save_reorder_pinned_dialogs_on_server_log_event(FolderId folder_id, const vector<DialogId> &dialog_ids);
+
+  static uint64 save_toggle_dialog_view_as_messages_on_server_log_event(DialogId dialog_id, bool view_as_messages);
 
   static uint64 save_toggle_dialog_is_marked_as_unread_on_server_log_event(DialogId dialog_id,
                                                                            bool is_marked_as_unread);

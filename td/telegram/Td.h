@@ -84,6 +84,7 @@ class StorageManager;
 class StoryManager;
 class ThemeManager;
 class TopDialogManager;
+class TranscriptionManager;
 class TranslationManager;
 class UpdatesManager;
 class VideoNotesManager;
@@ -213,6 +214,8 @@ class Td final : public Actor {
   ActorOwn<ThemeManager> theme_manager_actor_;
   unique_ptr<TopDialogManager> top_dialog_manager_;
   ActorOwn<TopDialogManager> top_dialog_manager_actor_;
+  unique_ptr<TranscriptionManager> transcription_manager_;
+  ActorOwn<TranscriptionManager> transcription_manager_actor_;
   unique_ptr<TranslationManager> translation_manager_;
   ActorOwn<TranslationManager> translation_manager_actor_;
   unique_ptr<UpdatesManager> updates_manager_;
@@ -634,6 +637,10 @@ class Td final : public Actor {
 
   void on_request(uint64 id, const td_api::clearAutosaveSettingsExceptions &request);
 
+  void on_request(uint64 id, const td_api::getChatSimilarChats &request);
+
+  void on_request(uint64 id, const td_api::getChatSimilarChatCount &request);
+
   void on_request(uint64 id, const td_api::getTopChats &request);
 
   void on_request(uint64 id, const td_api::removeTopChat &request);
@@ -745,6 +752,8 @@ class Td final : public Actor {
   void on_request(uint64 id, td_api::setDefaultReactionType &request);
 
   void on_request(uint64 id, td_api::getMessagePublicForwards &request);
+
+  void on_request(uint64 id, td_api::getStoryPublicForwards &request);
 
   void on_request(uint64 id, const td_api::removeNotification &request);
 
@@ -1006,6 +1015,8 @@ class Td final : public Actor {
 
   void on_request(uint64 id, td_api::setChatBackground &request);
 
+  void on_request(uint64 id, const td_api::deleteChatBackground &request);
+
   void on_request(uint64 id, td_api::setChatTheme &request);
 
   void on_request(uint64 id, td_api::setChatDraftMessage &request);
@@ -1013,6 +1024,8 @@ class Td final : public Actor {
   void on_request(uint64 id, const td_api::toggleChatHasProtectedContent &request);
 
   void on_request(uint64 id, const td_api::toggleChatIsPinned &request);
+
+  void on_request(uint64 id, const td_api::toggleChatViewAsTopics &request);
 
   void on_request(uint64 id, const td_api::toggleChatIsTranslatable &request);
 
@@ -1284,6 +1297,8 @@ class Td final : public Actor {
 
   void on_request(uint64 id, const td_api::setAccentColor &request);
 
+  void on_request(uint64 id, const td_api::setProfileAccentColor &request);
+
   void on_request(uint64 id, td_api::setSupergroupUsername &request);
 
   void on_request(uint64 id, td_api::toggleSupergroupUsernameIsActive &request);
@@ -1445,6 +1460,8 @@ class Td final : public Actor {
   void on_request(uint64 id, const td_api::getChatStatistics &request);
 
   void on_request(uint64 id, const td_api::getMessageStatistics &request);
+
+  void on_request(uint64 id, const td_api::getStoryStatistics &request);
 
   void on_request(uint64 id, td_api::getStatisticalGraph &request);
 
